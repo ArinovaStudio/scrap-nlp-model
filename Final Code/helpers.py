@@ -1,15 +1,18 @@
-from flask import Flask, request
-from flask_socketio import SocketIO, emit
+# helpers.py
+# Framework-agnostic helpers ONLY
 
+import hashlib
+import os
+import re
+import time
+import json
 import requests
 import pandas as pd
-from bs4 import BeautifulSoup
-import time
-import re
-import os
 import numpy as np
-import json
+from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
+from typing import Optional, Tuple
+
 import nltk
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
@@ -17,63 +20,122 @@ from nltk.tokenize import sent_tokenize, word_tokenize
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from collections import deque
 
-from io import BytesIO, StringIO  # for CSV text in WS
-from typing import Optional
+import base64
 
-# --- NEW: imports for scheduler ---
-import schedule
-import threading
-from datetime import datetime
+# =========================================================
+# -------------------- CONFIG ------------------------------
+# =========================================================
 
-# ---------- Scheduler configuration ----------
-# Weekly schedule configuration
-# e.g. "thursday" and "11:05"  (24-hour format)
-WEEKLY_DAY = "monday"   # monday, tuesday, wednesday, ...
-WEEKLY_TIME = "00:00"   # "HH:MM" 24h
+REQUEST_DELAY = 1.0
+TIMEOUT = 15
+# -------------------------------
+# Global request headers
+# -------------------------------
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
-# This will be set by the user via /set-weekly-url or WS event
-WEEKLY_SCRAPE_URL = None
-
-# ---------- HTTP / scraping configuration ----------
-REQUEST_DELAY = 1.0        # seconds between requests
-TIMEOUT = 15               # seconds for HTTP timeout
-USER_AGENT = 'Mozilla/5.0 (compatible; DataScraper/1.0)'
-MAX_PAGES = 2000           # max pages per collection (safety limit)
-
-# ---------- Ensure NLTK data (once at startup) ----------
-nltk_data = ['punkt', 'stopwords', 'wordnet', 'omw-1.4']
-for r in nltk_data:
-    try:
-        nltk.data.find(r)
-    except Exception:
-        nltk.download(r)
-
-
-# ---------- Helper utilities ----------
-_currency_re = re.compile(r'[^\d.,\-]+')
-MARKETING_WORDS = {
-    'buy now','best','new','free shipping','hot','sale','discount','offer','trending'
-}
-COLOR_WORDS = {
-    'black','white','red','blue','green','yellow','pink','orange','purple',
-    'brown','grey','gray','silver','gold','navy'
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Connection": "keep-alive",
 }
 
-# ---------- Config ----------
-# UPLOAD_FOLDER = "./uploads"
-# os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+MAX_PAGES = 2000
 
 SIMILARITY_THRESHOLD = 0.20
 TOP_K_DEFAULT = 3
 
-# ---------- Helpers ----------
+MARKETING_WORDS = {
+    "buy now", "best", "new", "free shipping", "hot",
+    "sale", "discount", "offer", "trending"
+}
+
+COLOR_WORDS = {
+    "black","white","red","blue","green","yellow","pink",
+    "orange","purple","brown","grey","gray","silver","gold","navy"
+}
+
 IRRELEVANT_KEYWORDS = [
-    "gym", "dumbbell", "exercise", "workout", "recipe", "food", "cooking",
-    "weather", "news", "politics", "relationship", "doctor", "medicine",
-    "math", "code", "python", "java", "cpp"
+    "gym","dumbbell","exercise","workout","recipe","food",
+    "weather","news","politics","doctor","medicine",
+    "math","code","python","java","cpp"
 ]
-_irrelevant_regex = re.compile(r'\b(' + r'|'.join(re.escape(w) for w in IRRELEVANT_KEYWORDS) + r')\b', flags=re.I)
+
+_irrelevant_regex = re.compile(
+    r"\b(" + r"|".join(re.escape(w) for w in IRRELEVANT_KEYWORDS) + r")\b",
+    flags=re.I
+)
+
+_currency_re = re.compile(r"[^\d.,\-]+")
+
+
+# =========================================================
+# -------------------- NLTK -------------------------------
+# =========================================================
+
+def ensure_nltk():
+    for pkg in ["punkt", "punkt_tab", "stopwords", "wordnet", "omw-1.4"]:
+        try:
+            nltk.data.find(pkg)
+        except LookupError:
+            nltk.download(pkg)
+
+
+ensure_nltk()
+
+stop_words = set(stopwords.words("english"))
+lemmatizer = WordNetLemmatizer()
+
+
+# =========================================================
+# -------------------- URL / CSV ---------------------------
+# =========================================================
+
+def path_to_base64(path: str) -> str:
+    """
+    Convert an absolute directory path into Base64 string.
+    """
+    if not path:
+        return ""
+    abs_path = os.path.abspath(path)
+    return base64.b64encode(abs_path.encode("utf-8")).decode("utf-8")
+
+def is_shopify_site(url: str) -> bool:
+    """
+    Safely detect if a site is Shopify.
+    """
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        html = r.text.lower()
+
+        # quick signal
+        if "cdn.shopify.com" not in html and not any(
+            "shopify" in v.lower() for v in r.headers.values()
+        ):
+            return False
+
+        # hard validation
+        test = requests.get(
+            url.rstrip("/") + "/products.json?limit=1",
+            headers=HEADERS,
+            timeout=TIMEOUT
+        )
+
+        if test.status_code != 200:
+            return False
+
+        data = test.json()
+        return isinstance(data, dict) and "products" in data
+
+    except Exception:
+        return False
 
 def url_to_name(url: str) -> str:
     """
@@ -158,7 +220,12 @@ def resolve_csv_for_url(page_url: str, output_dir: str) -> Optional[str]:
     # ---------------------------------------
     # Fallback to combined site CSV
     # ---------------------------------------
-    combined_csv = os.path.join(output_dir, f"{site_name}_combined.csv")
+    combined_csv = os.path.join(
+        output_dir,
+        site_name,
+        f"{site_name}_combined.csv"
+    )
+
     if os.path.exists(combined_csv):
         print(f"[resolve_csv_for_url] Using site combined CSV: {combined_csv}")
         return combined_csv
@@ -204,9 +271,6 @@ def clean_functional_text(txt):
     s = re.sub(r'[\r\n\t]+', ' ', s)
     return re.sub(r'\s+', ' ', s).strip()
 
-stop_words = set(stopwords.words('english'))
-lemmatizer = WordNetLemmatizer()
-
 def lemmatize_text(text):
     if not isinstance(text, str) or text.strip() == '':
         return ''
@@ -239,8 +303,136 @@ def looks_like_image_url(u):
     if pd.isna(u): return False
     return bool(re.search(r'\.(jpg|jpeg|png|webp|gif)$', str(u), flags=re.I))
 
-# ---------- Scraper: single collection ----------
+# ---------- Non - Shopify Scrapper ----------
 
+def generate_sku(url):
+    return "HTMLSKU_" + hashlib.md5(url.encode()).hexdigest()[:10]
+
+PRICE_REGEX = re.compile(r"(₹|\$|€)\s?\d+(?:,\d+)*(?:\.\d+)?")
+
+def extract_price(text):
+    m = PRICE_REGEX.search(text)
+    return m.group(0) if m else "N/A"
+
+def detect_stock(text):
+    t = text.lower()
+    if "out of stock" in t or "sold out" in t:
+        return "Out of Stock"
+    if "in stock" in t or "available" in t:
+        return "In Stock"
+    return "Unknown"
+
+def extract_image(soup, base_url):
+    img = soup.find("img")
+    return urljoin(base_url, img["src"]) if img and img.get("src") else "N/A"
+
+def extract_tags(soup):
+    meta = soup.find("meta", attrs={"name": "keywords"})
+    return meta.get("content") if meta else "N/A"
+
+def scrape_non_shopify_site(start_url: str, output_dir: str):
+    print("\n🚀 NON-SHOPIFY SCRAPER STARTED")
+
+    parsed = urlparse(start_url)
+    base_domain = parsed.netloc
+    site_name = base_domain.replace(".", "_")
+
+    site_dir = os.path.join(output_dir, site_name)
+    os.makedirs(site_dir, exist_ok=True)
+
+    visited = set()
+    queue = deque([start_url])
+    all_rows = []
+
+    while queue and len(visited) < MAX_PAGES:
+        current_url = queue.popleft()
+        if current_url in visited:
+            continue
+
+        visited.add(current_url)
+        print(f"Scraping → {current_url}")
+
+        try:
+            r = requests.get(
+                current_url,
+                headers={"User-Agent": USER_AGENT},
+                timeout=TIMEOUT
+            )
+            if r.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            for t in soup(["script", "style", "noscript"]):
+                t.decompose()
+
+            # ---------------- PAGE DATA ----------------
+            h1 = soup.find("h1")
+            product_title = (
+                h1.get_text(strip=True)
+                if h1 else soup.title.string.strip()
+                if soup.title else "N/A"
+            )
+
+            full_text = soup.get_text(" ", strip=True)
+            price = extract_price(full_text)
+            stock = detect_stock(full_text)
+            image_url = extract_image(soup, current_url)
+            tags = extract_tags(soup)
+
+            path_parts = [p for p in urlparse(current_url).path.split("/") if p]
+            category = path_parts[0] if path_parts else "N/A"
+
+            row = {
+                "Collection URL": start_url,
+                "Product Name": product_title,
+                "Variant Name": "N/A",
+                "SKU": generate_sku(current_url),
+                "In Stock?": stock,
+                "Price": price,
+                "Original Price": "N/A",
+                "Discount Info": "N/A",
+                "Vendor (Brand)": base_domain,
+                "Category": category,
+                "Tags": tags,
+                "Functional Details": full_text[:3000],
+                "Link": current_url,
+                "Main Image URL": image_url
+            }
+
+            # ---------- SAVE PAGE CSV ----------
+            page_df = pd.DataFrame([row])
+            page_csv = os.path.join(site_dir, f"{url_to_name(current_url)}.csv")
+            page_df.to_csv(page_csv, index=False, encoding="utf-8")
+
+            all_rows.append(row)
+
+            # ---------- LINK DISCOVERY ----------
+            for a in soup.find_all("a", href=True):
+                link = urljoin(current_url, a["href"])
+                parsed_link = urlparse(link)
+                if parsed_link.netloc == base_domain:
+                    clean = parsed_link.scheme + "://" + parsed_link.netloc + parsed_link.path
+                    if clean not in visited:
+                        queue.append(clean)
+
+            time.sleep(REQUEST_DELAY)
+
+        except Exception as e:
+            print(f"Failed → {current_url} | {e}")
+
+    # =====================================================
+    # COMBINE ALL PAGES
+    # =====================================================
+    if all_rows:
+
+        print("\n✅ SCRAPING COMPLETED")
+        print(f"Pages scraped: {len(all_rows)}")
+    else:
+        print("❌ No pages scraped")
+    
+    return pd.DataFrame(all_rows)
+
+# ---------- Shopify Scrapper ----------
 def scrape_shopify_products(base_collection_url, headers=None, sleep_sec=1, limit_per_page=250, max_pages=50):
     """
     Scrapes products.json using a collection URL as base.
@@ -262,7 +454,7 @@ def scrape_shopify_products(base_collection_url, headers=None, sleep_sec=1, limi
             break
         url = f"{json_endpoint}?page={page}&limit={limit_per_page}"
         try:
-            resp = requests.get(url, headers=headers, timeout=TIMEOUT)
+            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             if resp.status_code != 200:
                 # stop on non-200
                 break
@@ -614,8 +806,8 @@ def preprocess_variants_df(df_raw, category_threshold=0.5, variant_color_combine
     working['product_url'] = working['product_url'].apply(clean_url)
 
     img_frac = working['image_url'].apply(looks_like_image_url).mean() if 'image_url' in working.columns else 0
-    if 'image_url' in working.columns and img_frac > 0.99:
-        working.drop(columns=['image_url'], inplace=True)
+    # if 'image_url' in working.columns and img_frac > 0.99:
+    #     working.drop(columns=['image_url'], inplace=True)
 
     working['search_content'] = (
         working.get('title','') + " " +
@@ -625,7 +817,7 @@ def preprocess_variants_df(df_raw, category_threshold=0.5, variant_color_combine
     export_cols = [
         'sku','title','price_current','price_original','discount_percent',
         'stock_status','summary','long_description','search_content',
-        'indexed_text_lemma','product_url'
+        'indexed_text_lemma','product_url','image_url'
     ]
     export_cols = [c for c in export_cols if c in working.columns]
     cleaned = working[export_cols].copy()
@@ -683,13 +875,14 @@ def query_search_from_index(query: str,
                             top_k: int):
     """
     Returns a DataFrame with:
-      clean_text, product_title, url, score, sku,
+      clean_text, product_title, url, image_url, score, sku,
       price_current, price_original, discount_percent, stock_status,
       summary, long_description
     """
     q_vec = vectorizer.transform([query])
     sims = cosine_similarity(q_vec, tfidf_matrix).ravel()
     idxs = sims.argsort()[::-1][:top_k]
+
     rows = []
     for i in idxs:
         row = df.iloc[i]
@@ -697,6 +890,7 @@ def query_search_from_index(query: str,
             "clean_text": row.get("search_content", "") or row.get(text_field, ""),
             "product_title": row.get("title", ""),
             "url": row.get("product_url", "") or row.get("url", ""),
+            "image_url": row.get("image_url", ""),   # ✅ ADD THIS
             "score": float(sims[i]),
             "sku": row.get("sku", ""),
             "price_current": row.get("price_current", ""),
@@ -706,6 +900,7 @@ def query_search_from_index(query: str,
             "summary": row.get("summary", ""),
             "long_description": row.get("long_description", "")
         })
+
     return pd.DataFrame(rows)
 
 def extractive_summary_from_retrieved(retrieved_df, top_k=TOP_K_DEFAULT):
@@ -734,6 +929,13 @@ def detect_question_intent(query: str) -> str:
     # stock / availability / status
     if any(kw in q for kw in ["stock", "in stock", "out of stock", "available", "availability", "status"]):
         return "stock"
+    
+    if any(k in q for k in ["url", "link", "product url", "product link"]):
+        return "url"
+
+    if any(k in q for k in ["image", "photo", "picture"]):
+        return "image"
+    
     # more details / explanation
     detail_phrases = [
         "more detail", "more details", "more in detail",
@@ -799,6 +1001,8 @@ def looks_like_followup(query: str, has_previous_product: bool) -> bool:
         "color", "colour", "size",
         "details", "more about", "explain",
         "stock", "availability", "status", "available", "in stock", "out of stock",
+        "url", "link", "product url", "product link",
+        "image", "photo", "picture"
     ]
     # slightly more lenient length limit (was 7)
     if any(kw in q for kw in follow_keywords) and len(q.split()) <= 9:
@@ -820,794 +1024,74 @@ def looks_like_followup(query: str, has_previous_product: bool) -> bool:
 
     return False
 
-
-# ---------- Main handler (stateless per-request) ----------
-def handle_query_with_uploaded_csv(df: pd.DataFrame, query: str, top_k: int = TOP_K_DEFAULT):
+def run_scrape_pipeline(base_url: str, output_dir: str):
+    is_collection = False
     """
-    df: uploaded dataframe (already read from CSV)
-    query: user query string
-    returns: dict with structure {query, top_results, final_answer, product_links}
-    """
-    fallback_msg = (
-        "Sorry, I couldn't answer that. "
-        "I can assist you with product, website, business or item-related queries."
-    )
+    Framework-agnostic scrape pipeline.
 
-    if is_irrelevant(query):
-        return {
-            "query": query,
-            "top_results": [],
-            "final_answer": fallback_msg,
-            "product_links": []
-        }
-
-    # choose field and index
-    text_field = choose_text_field(df)
-    vectorizer, tfidf_matrix = build_tfidf_index(df, text_field)
-
-    # retrieval
-    retrieved = query_search_from_index(
-        query=query,
-        df=df,
-        vectorizer=vectorizer,
-        tfidf_matrix=tfidf_matrix,
-        text_field=text_field,
-        top_k=top_k
-    )
-
-    if retrieved.empty:
-        return {
-            "query": query,
-            "top_results": [],
-            "final_answer": fallback_msg,
-            "product_links": []
-        }
-
-    best_score = float(retrieved["score"].max())
-
-    # --- smart override: if query string is clearly matching a product title, don't fallback ---
-    q_lower = query.lower()
-    has_strong_title_match = False
-    for _, r in retrieved.iterrows():
-        title = (r.get("product_title") or "").lower()
-        if title and q_lower in title:
-            has_strong_title_match = True
-            break
-
-    # Only hard-fallback if absolutely nothing matches (score == 0) and no strong title hint
-    if best_score < SIMILARITY_THRESHOLD and not has_strong_title_match:
-        return {
-            "query": query,
-            "top_results": safe_jsonify(retrieved.to_dict(orient="records")),
-            "final_answer": fallback_msg,
-            "product_links": []
-        }
-
-    # ---------- Column-aware answering ----------
-    intent = detect_question_intent(query)
-    top = retrieved.iloc[0]
-
-    title = (top.get("product_title") or "").strip()
-    price_current = str(top.get("price_current") or "").strip()
-    price_original = str(top.get("price_original") or "").strip()
-    discount_percent = str(top.get("discount_percent") or "").strip()
-    stock_status = str(top.get("stock_status") or "").strip()
-    summary_txt = str(top.get("summary") or "").strip()
-    long_desc = str(top.get("long_description") or "").strip()
-
-    final_answer = None
-
-    # 1) Price-type questions
-    if intent == "price":
-        if price_current and price_current.lower() != "nan":
-            final_answer = f"The current price of {title} is {price_current}."
-            if discount_percent and discount_percent.lower() not in ["nan", ""]:
-                final_answer += f" It currently has a discount of {discount_percent}%."
-        elif price_original and price_original.lower() != "nan":
-            final_answer = (
-                f"The price information of {title} is not fully available, "
-                f"but the original price is {price_original}."
-            )
-
-    elif intent == "orig_price":
-        if price_original and price_original.lower() != "nan":
-            final_answer = f"The original price (before discount) of {title} is {price_original}."
-        elif price_current and price_current.lower() != "nan":
-            final_answer = (
-                f"The original price is not available, "
-                f"but the current price of {title} is {price_current}."
-            )
-
-    elif intent == "discount":
-        if discount_percent and discount_percent.lower() != "nan" and discount_percent != "":
-            final_answer = f"{title} currently has a discount of {discount_percent}%."
-        elif price_original and price_current and \
-             price_original.lower() != "nan" and price_current.lower() != "nan":
-            try:
-                po = float(price_original)
-                pc = float(price_current)
-                if po > 0:
-                    disc = round((po - pc) / po * 100, 1)
-                    final_answer = f"{title} has an approximate discount of {disc}%."
-            except Exception:
-                pass
-
-    elif intent == "stock":
-        if stock_status and stock_status.lower() != "nan":
-            final_answer = f"{title} is currently {stock_status}."
-        else:
-            final_answer = f"The stock status of {title} is not clearly available."
-
-    # 2) Detail questions → use long_description
-    elif intent == "detail":
-        if long_desc and long_desc.lower() != "nan":
-            final_answer = f"Here are more details about {title}: {long_desc}"
-        elif summary_txt:
-            final_answer = f"Here is a summary of {title}: {summary_txt}"
-
-    # 3) General questions → use summary
-    if intent == "general" and not final_answer:
-        if summary_txt and summary_txt.lower() != "nan":
-            final_answer = f"{title}: {summary_txt}"
-        else:
-            final_answer = extractive_summary_from_retrieved(retrieved, top_k=top_k) or fallback_msg
-
-    # Safety fallback
-    if not final_answer:
-        if summary_txt:
-            final_answer = f"{title}: {summary_txt}"
-        else:
-            final_answer = extractive_summary_from_retrieved(retrieved, top_k=top_k) or fallback_msg
-
-    product_links = [
-        r.get("url") for _, r in retrieved.head(top_k).iterrows()
-        if r.get("url")
-    ]
-
-    out = {
-        "query": query,
-        "top_results": safe_jsonify(retrieved.to_dict(orient="records")),
-        "final_answer": final_answer,
-        "product_links": product_links
-    }
-    return out
-
-app = Flask(__name__)
-app.config['OUTPUT_DIR'] = os.path.join(os.getcwd(), "csv files")
-os.makedirs(app.config['OUTPUT_DIR'], exist_ok=True)
-
-# app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB
-
-socketio = SocketIO(
-    app,
-    cors_allowed_origins="*",
-    logger=True,
-    engineio_logger=True
-)  # WSS-ready behind HTTPS / reverse proxy
-
-# Simple in-memory session store (per WebSocket connection)
-SESSION_MEMORY = {}  # { sid: {"history": [...], "tokens_left": int|None, "active_chat": bool} }
-
-# ---------- Shared pipeline for HTTP + WS ----------
-
-def run_scrape_pipeline(base_url: str):
-    """
-    Run full pipeline:
-      - If base_url contains '/collections/': scrape that collection only
-      - Else: treat as site root, discover all collections & scrape them all
-      - Preprocess and write a combined CSV
-      - (Additionally, site-root mode writes per-collection CSVs under outputs/<site_name>/)
-
-    Returns (out_path, out_fname, row_count)
-    Raises ValueError for user-facing errors, Exception for internal errors.
+    Returns:
+        (site_dir, out_fname, row_count)
     """
     if not base_url:
         raise ValueError("No 'url' provided.")
+
+    if not output_dir:
+        raise ValueError("No 'output_dir' provided.")
 
     parsed = urlparse(base_url)
     if not parsed.scheme or not parsed.netloc:
         raise ValueError(f"Invalid URL provided: {base_url}")
 
-    # Decide mode: single collection vs entire site
-    is_collection = '/collections/' in parsed.path
+    os.makedirs(output_dir, exist_ok=True)
 
-    if is_collection:
-        print(f"[Pipeline] Treating URL as single collection: {base_url}")
-        raw_df = scrape_shopify_products(
-            base_collection_url=base_url,
-            headers={'User-Agent': USER_AGENT},
-            sleep_sec=REQUEST_DELAY,
-            max_pages=MAX_PAGES
-        )
-        site_specific_dir = None
+    # ======================================================
+    # Decide scraper type
+    # ======================================================
+    shopify = is_shopify_site(base_url)
+
+    if shopify:
+        print(f"[Pipeline] Shopify site detected → {base_url}")
+
+        is_collection = "/collections/" in parsed.path
+
+        if is_collection:
+            raw_df = scrape_shopify_products(
+                base_collection_url=base_url,
+                headers=HEADERS,
+                sleep_sec=REQUEST_DELAY,
+                max_pages=MAX_PAGES
+            )
+        else:
+            raw_df, _ = scrape_all_collections(
+                start_url=base_url,
+                base_save_dir=output_dir
+            )
+
     else:
-        print(f"[Pipeline] Treating URL as site root (multi-collection): {base_url}")
-        raw_df, site_specific_dir = scrape_all_collections(
+        print(f"[Pipeline] Non-Shopify site detected → {base_url}")
+
+        raw_df = scrape_non_shopify_site(
             start_url=base_url,
-            base_save_dir=app.config['OUTPUT_DIR']
+            output_dir=output_dir
         )
 
-    if raw_df is None or raw_df.shape[0] == 0:
-        raise ValueError("No data scraped from the endpoint. Check the URL or site settings.")
+    if raw_df is None or raw_df.empty:
+        raise ValueError("No data scraped from the endpoint.")
 
     cleaned = preprocess_variants_df(raw_df)
+    if cleaned.empty:
+        raise ValueError("No usable rows after preprocessing.")
 
-    name = url_to_name(base_url)
-    out_fname = f"{name}.csv" if is_collection else f"{name}_combined.csv"
-    out_path = os.path.join(app.config['OUTPUT_DIR'], out_fname)
+    # 🔹 CREATE SITE-SPECIFIC FOLDER (AFTER SCRAPING)
+    site_slug = url_to_name(base_url)
+    site_dir = os.path.join(output_dir, site_slug)
+    os.makedirs(site_dir, exist_ok=True)
 
-    cleaned.to_csv(out_path, index=False, encoding='utf-8')
-    print(f"[Pipeline] Saved preprocessed CSV: {out_path} (rows={len(cleaned)})")
+    out_fname = f"{site_slug}.csv" if is_collection else f"{site_slug}_combined.csv"
+    out_path = os.path.join(site_dir, out_fname)
 
-    return out_path, out_fname, len(cleaned)
+    cleaned.to_csv(out_path, index=False, encoding="utf-8")
+    print(f"[Pipeline] Saved CSV → {out_path} ({len(cleaned)} rows)")
 
-@socketio.on("health")
-def ws_health():
-    emit("health-result", {
-        "status": "ok",
-        "weekly_url": WEEKLY_SCRAPE_URL,
-        "day": WEEKLY_DAY,
-        "time": WEEKLY_TIME
-    })
-
-# ---------- WebSocket handlers ----------
-@socketio.on("connect")
-def ws_connect():
-    sid = request.sid
-    print(f"[WS] Client connected: {sid}")
-    # initialize empty history, no token limit, and no active chat by default
-    SESSION_MEMORY[sid] = {
-        "history": [],
-        "tokens_left": None,   # None = unlimited until frontend sets it
-        "active_chat": False   # no chat started yet
-    }
-    emit("system", {"message": "Connected to query API WebSocket."})
-
-@socketio.on("disconnect")
-def ws_disconnect():
-    sid = request.sid
-    print(f"[WS] Client disconnected: {sid}")
-    # clear history for this connection
-    SESSION_MEMORY.pop(sid, None)
-
-@socketio.on("reset_session")
-def ws_reset_session(data=None):
-    sid = request.sid
-    prev_state = SESSION_MEMORY.get(sid, {})
-    tokens_left = prev_state.get("tokens_left", None)
-
-    # Reset only conversation context
-    SESSION_MEMORY[sid] = {
-        "history": [],
-        "tokens_left": tokens_left,
-        "active_chat": False
-    }
-    emit("system", {"message": "Session context reset."})
-
-@socketio.on("run-scrape")
-def ws_run_scrape(data):
-    """
-    WebSocket version of /run-scrape
-
-    Expected message:
-    {
-      "url": "<site_or_collection_url>"
-    }
-
-    Emits:
-      - "run-scrape-status"
-      - "run-scrape-result"
-    """
-    base_url = None
-    if isinstance(data, dict):
-        base_url = data.get("url")
-
-    if not base_url:
-        emit("run-scrape-result", {
-            "success": False,
-            "error": "No 'url' provided in WebSocket message."
-        })
-        return
-
-    emit("run-scrape-status", {
-        "status": "started",
-        "url": base_url
-    })
-
-    try:
-        out_path, out_fname, row_count = run_scrape_pipeline(base_url)
-        emit("run-scrape-result", {
-            "success": True,
-            "url": base_url,
-            "file_name": out_fname,
-            "file_path": out_path,  # internal path
-            "rows": row_count
-        })
-    except ValueError as e:
-        emit("run-scrape-result", {
-            "success": False,
-            "url": base_url,
-            "error": str(e)
-        })
-    except Exception as e:
-        emit("run-scrape-result", {
-            "success": False,
-            "url": base_url,
-            "error": "Internal error in scraper pipeline",
-            "details": str(e)
-        })
-
-@socketio.on("set-weekly-url")
-def ws_set_weekly_url(data):
-    """
-    WebSocket version of /set-weekly-url
-
-    Expected message:
-    {
-      "url": "https://..."
-    }
-
-    Emits:
-      - "set-weekly-url-result"
-    """
-    global WEEKLY_SCRAPE_URL
-
-    url = None
-    if isinstance(data, dict):
-        url = data.get("url")
-
-    if not url:
-        emit("set-weekly-url-result", {
-            "success": False,
-            "error": "Missing 'url' in message"
-        })
-        return
-
-    parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        emit("set-weekly-url-result", {
-            "success": False,
-            "error": "Invalid URL provided",
-            "url": url
-        })
-        return
-
-    WEEKLY_SCRAPE_URL = url
-    emit("set-weekly-url-result", {
-        "success": True,
-        "weekly_url": WEEKLY_SCRAPE_URL,
-        "day": WEEKLY_DAY,
-        "time": WEEKLY_TIME
-    })
-
-@socketio.on("query_with_inputs")
-def ws_query_with_inputs(data):
-    """
-    WebSocket query handler with:
-      - URL-based CSV resolution OR inline csv_text
-      - per-chat token logic (1 token per completed chat)
-
-    Supported payloads:
-
-    1) CSV text (inline):
-       {
-         "csv_text": "<raw CSV content>",
-         "query": "What is the price of ...?",
-         "top_k": 3,
-         "request_id": "abc123",
-         "token_init": 10,   # optional, only once per connection
-         "end_chat": false   # optional, set true to consume 1 token
-       }
-
-    2) URL-based:
-       {
-         "page_url": "https://shop.com/collections/hoodies",
-         # or "url": "https://shop.com/collections/hoodies",
-         "query": "What is the cheapest hoodie?",
-         "top_k": 3,
-         "request_id": "abc123",
-         "token_init": 10,
-         "end_chat": false
-       }
-
-    Emits:
-      - "query_result": {
-          success,
-          result or error,
-          request_id?,
-          tokens_left?,
-          chat_ended?,
-          meta?: {csv_source, csv_path, page_url}
-        }
-    """
-    request_id = None
-    sid = request.sid  # current websocket connection id
-
-    try:
-        # ---------- 0) Basic validation ----------
-        if not isinstance(data, dict):
-            emit("query_result", {
-                "success": False,
-                "error": "Payload must be a JSON object"
-            })
-            return
-
-        request_id = data.get("request_id")
-
-        # ---------- 0.1) Fetch and/or initialize session state (tokens + history) ----------
-        session_state = SESSION_MEMORY.get(sid, {
-            "history": [],
-            "tokens_left": None,
-            "active_chat": False
-        })
-
-        # Is this message explicitly ending the chat?
-        end_chat_flag = bool(data.get("end_chat", False))
-        
-        if not isinstance(session_state, dict):
-            session_state = {
-                "history": [],
-                "tokens_left": None,
-                "active_chat": False
-            }
-
-        history = session_state.get("history") or []
-        if not isinstance(history, list):
-            history = []
-
-        tokens_left = session_state.get("tokens_left", None)
-        active_chat = bool(session_state.get("active_chat", False))
-
-        # Frontend can initialize tokens (usually once per connection)
-        if "token_init" in data:
-            try:
-                tokens_left = int(data["token_init"])
-            except Exception:
-                # bad / non-int: ignore, keep old tokens_left
-                pass
-
-        # ---------- 0.2) Determine if this is the start of a chat ----------
-        # Start of a new chat = currently not active
-        if not active_chat:
-            # If we have a token limit and it's 0, block new chat
-            if tokens_left is not None and tokens_left <= 0:
-                emit("query_result", {
-                    "success": False,
-                    "request_id": request_id,
-                    "error": "Tokens are Out of Stock. Please Add Tokens.",
-                    "tokens_left": tokens_left
-                })
-                SESSION_MEMORY[sid] = {
-                    "history": history,
-                    "tokens_left": tokens_left,
-                    "active_chat": False
-                }
-                return
-
-            # Otherwise, mark this chat as active
-            active_chat = True
-
-            # ✅ NEW: since this is a *new* chat, drop previous context
-            history = []
-
-        # ---------- 0.3) Get query + CSV/URL inputs ----------
-        page_url = data.get("page_url") or data.get("url")
-        csv_text = data.get("csv_text")
-        query_text = data.get("quer") or data.get("query") or data.get("q")
-
-        if not query_text or str(query_text).strip() == "":
-            SESSION_MEMORY[sid] = {
-                "history": history,
-                "tokens_left": tokens_left,
-                "active_chat": active_chat
-            }
-            emit("query_result", {
-                "success": False,
-                "error": "Missing 'query' (or 'quer'/'q') in message",
-                "request_id": request_id,
-                "tokens_left": tokens_left
-            })
-            return
-
-        try:
-            top_k = int(data.get("top_k", TOP_K_DEFAULT))
-        except Exception:
-            top_k = TOP_K_DEFAULT
-
-        # ---------- 1) Decide how to get the CSV ----------
-        csv_source = None
-        csv_path_used = None
-
-        if csv_text and str(csv_text).strip() != "":
-            # Old behaviour: client sends CSV content directly
-            df = pd.read_csv(StringIO(csv_text), dtype=str).fillna("")
-            csv_source = "inline"
-
-        elif page_url:
-            # URL-based: resolve CSV on disk
-            csv_path = resolve_csv_for_url(page_url, app.config["OUTPUT_DIR"])
-            if not csv_path:
-                SESSION_MEMORY[sid] = {
-                    "history": history,
-                    "tokens_left": tokens_left,
-                    "active_chat": active_chat
-                }
-                emit("query_result", {
-                    "success": False,
-                    "error": "No CSV found for this URL. Run scrape first for this site.",
-                    "page_url": page_url,
-                    "request_id": request_id,
-                    "tokens_left": tokens_left
-                })
-                return
-
-            raw_df = pd.read_csv(csv_path, dtype=str)
-
-            # If this looks like raw scraper output (no 'search_content'/'indexed_text_lemma'),
-            # preprocess it; otherwise assume already preprocessed.
-            if ("search_content" not in raw_df.columns) and ("indexed_text_lemma" not in raw_df.columns):
-                df = preprocess_variants_df(raw_df)
-            else:
-                df = raw_df
-
-            df = df.fillna("")
-            csv_source = "file"
-            csv_path_used = csv_path
-
-        else:
-            SESSION_MEMORY[sid] = {
-                "history": history,
-                "tokens_left": tokens_left,
-                "active_chat": active_chat
-            }
-            emit("query_result", {
-                "success": False,
-                "error": "Provide either 'csv_text' or 'page_url'/'url' in the message",
-                "request_id": request_id,
-                "tokens_left": tokens_left
-            })
-            return
-        # ---------- 2) Fetch previous context for this WS session ----------
-        previous_product_title = None
-        previous_sku = None
-
-        # Use context for any message while the chat is active.
-        # We will clear it AFTER answering if end_chat_flag is True.
-        use_context = active_chat
-
-        if use_context and history:
-            last_turn = history[-1]
-            if isinstance(last_turn, dict):
-                last_result = last_turn.get("result")
-                if isinstance(last_result, dict):
-                    top_results = last_result.get("top_results") or []
-                    if isinstance(top_results, list) and len(top_results) > 0:
-                        top0 = top_results[0]
-                        if isinstance(top0, dict):
-                            previous_product_title = (top0.get("product_title") or "").strip()
-                            previous_sku = str(top0.get("sku") or "").strip()
-
-
-        # ---------- 3) Decide if this is follow-up or fresh query ----------
-        current_q = str(query_text)
-        has_prev_product = bool(previous_product_title or previous_sku)
-        is_followup = looks_like_followup(current_q, has_prev_product)
-
-        # Use intent to decide whether to override follow-up detection
-        intent = detect_question_intent(current_q)
-
-        # --- OVERRIDE: only for long, GENERAL queries with no explicit "this product" ref ---
-        words = current_q.strip().lower().split()
-        explicit_ref_words = ["this", "that", "it", "product", "above", "previous", "earlier", "same"]
-        has_explicit_ref = any(w in current_q.lower() for w in explicit_ref_words)
-
-        if (
-            is_followup
-            and not has_explicit_ref
-            and len(words) > 3        # long-ish query
-            and intent == "general"   # NOT price/discount/stock/detail follow-ups
-        ):
-            # Treat as new product/topic instead of follow-up
-            is_followup = False
-
-        # ---------- 3.1) Guardrail: block underspecified price/discount/stock questions with no product context ----------
-        if (
-            not has_prev_product           # no previous product in context
-            and not is_followup           # not detected as follow-up
-            and intent in ["price", "discount", "stock", "orig_price"]
-        ):
-            # Very short generic queries like "price?", "what is the price?" etc.
-            if len(words) <= 5:
-                generic_fallback = (
-                    "Sorry, I couldn't answer that. "
-                    "Please mention the product name, SKU, or paste a product link so I can look up the exact price or stock."
-                )
-
-                # --- NEW: handle tokens + chat_ended here as well ---
-                chat_ended = False
-                if end_chat_flag:
-                    if tokens_left is not None:
-                        tokens_left = max(0, tokens_left - 1)
-                    active_chat = False
-                    history = []   # drop any context
-                    chat_ended = True
-
-                # Persist updated session state
-                SESSION_MEMORY[sid] = {
-                    "history": history,
-                    "tokens_left": tokens_left,
-                    "active_chat": active_chat
-                }
-
-                emit("query_result", {
-                    "success": True,
-                    "request_id": request_id,
-                    "result": {
-                        "query": current_q,
-                        "top_results": [],
-                        "final_answer": generic_fallback,
-                        "product_links": []
-                    },
-                    "meta": {
-                        "csv_source": csv_source,
-                        "csv_path": csv_path_used,
-                        "page_url": page_url
-                    },
-                    "tokens_left": tokens_left,
-                    "chat_ended": chat_ended
-                })
-                return
-
-        # ---------- 3.2) Build effective query ----------
-        if is_followup and has_prev_product:
-            if previous_product_title and previous_sku:
-                effective_query = f"{current_q.strip()} for product: {previous_product_title} (SKU: {previous_sku})"
-            elif previous_product_title:
-                effective_query = f"{current_q.strip()} for product: {previous_product_title}"
-            else:
-                effective_query = f"{current_q.strip()} for product with SKU: {previous_sku}"
-        else:
-            effective_query = current_q
-
-        # ---------- 4) Run handler on effective query ----------
-        result = handle_query_with_uploaded_csv(
-            df=df,
-            query=effective_query,
-            top_k=top_k
-        )
-
-        # ---------- Meta info ----------
-        result_meta = {
-            "csv_source": csv_source,   # "inline" or "file"
-            "csv_path": csv_path_used,  # server path if file-based
-            "page_url": page_url
-        }
-
-        # ---------- 5) Update session history (keep last 5 turns) ----------
-        history.append({
-            "query": current_q,
-            "effective_query": effective_query,
-            "result": result,
-            "csv_meta": result_meta,
-            "timestamp": time.time()
-        })
-        if len(history) > 5:
-            history = history[-5:]
-
-        # ---------- 6) If chat is ending, consume ONE token and clear history ----------
-        if end_chat_flag:
-            if tokens_left is not None:
-                tokens_left = max(0, tokens_left - 1)
-            active_chat = False     # Next query will be treated as a new chat
-            history = []            # Drop previous context completely
-
-        # ---------- 7) Persist updated session state ----------
-        SESSION_MEMORY[sid] = {
-            "history": history,
-            "tokens_left": tokens_left,
-            "active_chat": active_chat
-        }
-
-        # ---------- 8) Emit back to client ----------
-        emit("query_result", {
-            "success": True,
-            "request_id": request_id,
-            "result": safe_jsonify(result),
-            "meta": result_meta,
-            "tokens_left": tokens_left,
-            "chat_ended": end_chat_flag
-        })
-
-    except Exception as e:
-        # Preserve current tokens/history state on error
-        session_state = SESSION_MEMORY.get(sid, {
-            "history": [],
-            "tokens_left": None,
-            "active_chat": False
-        })
-        tokens_left = session_state.get("tokens_left", None)
-        active_chat = session_state.get("active_chat", False)
-        history = session_state.get("history", [])
-
-        SESSION_MEMORY[sid] = {
-            "history": history,
-            "tokens_left": tokens_left,
-            "active_chat": active_chat
-        }
-
-        emit("query_result", {
-            "success": False,
-            "request_id": request_id,
-            "error": "Exception during query handling",
-            "details": str(e),
-            "tokens_left": tokens_left
-        })
-
-def weekly_scrape_job():
-    """
-    Weekly background job:
-     - Runs run_scrape_pipeline(WEEKLY_SCRAPE_URL)
-     - Saves combined preprocessed CSV (and per-collection CSVs in site-root mode)
-     - Broadcasts result via WebSocket event "weekly-scrape-result"
-    """
-    global WEEKLY_SCRAPE_URL
-
-    now = datetime.now()
-    print(f"\n--- Weekly scheduler tick at {now} ---")
-
-    if not WEEKLY_SCRAPE_URL:
-        msg = "WEEKLY_SCRAPE_URL is not set yet. Skipping."
-        print("  [Weekly]", msg)
-        socketio.emit("weekly-scrape-result", {
-            "success": False,
-            "message": msg,
-            "timestamp": now.isoformat()
-        }, broadcast=True)
-        return
-
-    print(f"  [Weekly] Starting pipeline for {WEEKLY_SCRAPE_URL}")
-    try:
-        out_path, out_fname, row_count = run_scrape_pipeline(WEEKLY_SCRAPE_URL)
-        print(f"  [Weekly] Saved {row_count} rows to {out_path}")
-
-        socketio.emit("weekly-scrape-result", {
-            "success": True,
-            "url": WEEKLY_SCRAPE_URL,
-            "file_name": out_fname,
-            "file_path": out_path,
-            "rows": row_count,
-            "timestamp": now.isoformat()
-        }, broadcast=True)
-    except Exception as e:
-        msg = f"Error during weekly scrape: {e}"
-        print("  [Weekly]", msg)
-        socketio.emit("weekly-scrape-result", {
-            "success": False,
-            "message": msg,
-            "url": WEEKLY_SCRAPE_URL,
-            "timestamp": now.isoformat()
-        }, broadcast=True)
-
-def start_scheduler():
-    """
-    Start a background thread that runs the weekly schedule.
-    """
-    day = WEEKLY_DAY.lower()
-    job = getattr(schedule.every(), day)
-    job.at(WEEKLY_TIME).do(weekly_scrape_job)
-
-    print(f"Scheduler: configured weekly job on {WEEKLY_DAY} at {WEEKLY_TIME}")
-
-    def run_loop():
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
-
-    t = threading.Thread(target=run_loop, daemon=True)
-    t.start()
-
-if __name__ == '__main__':
-    start_scheduler()
-    print("Starting combined Web Scrapper + query API server...")
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    # 🔁 RETURN SITE DIR (for Base64)
+    return site_dir, out_fname, len(cleaned)
